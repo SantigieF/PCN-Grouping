@@ -1,0 +1,442 @@
+/**
+ * @OnlyCurrentDoc
+ * EU CLP Annex VIII — PCN Mode 1 (conservative exact-reporting-range screening).
+ * Adapted to the example PCN.xlsx / Sheet1 layout, 25 October 2026.
+ * Version 1.1: MATCH AND GROUP EXCLUSIVELY BY RAW MATERIAL CODE (row 2).
+ * CAS/EC numbers and optional reference IDs are display/reference data only.
+ * Each MiM is handled as one raw material component, not expanded into CAS numbers.
+ *
+ * SOURCE: DO NOT EDIT. One formulation per row; one raw-material block per four columns:
+ *   Row 1: major-concern flag (if populated)
+ *   Row 2: raw material code (the ONLY component matching key)
+ *   Row 3: CAS number (if available)
+ *   Row 4: EC number (if available)
+ *   Row 5: ACT | RANGE | MIN | MAX
+ *   Row 6+: products, ID in column A
+ *
+ * This is a screening tool, NOT a PCN submission, IUCLID validation, final CLP
+ * classification or verification that group submission is legally appropriate.
+ * No grouping under the perfume exception, generic identifiers or ICGs in Mode 1.
+ *
+ * CRITICAL: The sample combines direct percentage numbers (41 = 41%) AND
+ * percent-formatted fractions (0.2594 shown as 25.94%). Always interpret
+ * getValues() together with getNumberFormats(), separately for each cell.
+ */
+const PCN1 = Object.freeze({
+  SOURCE_SHEET: 'Sheet1',
+  MAJOR_CONCERN_ROW: 1,
+  MATERIAL_ROW: 2,
+  CAS_ROW: 3,
+  EC_ROW: 4,
+  SUBHEADER_ROW: 5,
+  FIRST_PRODUCT_ROW: 6,
+  PRODUCT_ID_COL: 1,
+  FIRST_MATERIAL_COL: 2,
+  READ_BATCH_ROWS: 75,  // Avoid enormous memory consumption on wide worksheets.
+  WRITE_BATCH_ROWS: 1200,
+  EPS: 1e-6,
+  TOTAL_TOLERANCE: 1.0,
+  GROUP_PREFIX: 'M1-',
+  PROVISIONAL_PREFIX: 'P-'
+});
+
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu('PCN Mode 1')
+    .addItem('1. Create/update reference sheets', 'pcn1Setup')
+    .addItem('2. Run conservative grouping', 'pcn1Run')
+    .addToUi();
+}
+
+function pcn1Setup() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const source = pcn1Source_(ss);
+  const components = pcn1Headers_(source);
+  pcn1EnsureRegister_(ss, components);
+  pcn1EnsureClassification_(ss, pcn1ProductIds_(source));
+  ss.toast('Reference sheets ready. Grouping uses RAW MATERIAL CODE only. Confirm Substance/MiM type, major-concern status and final mixture CLP classifications.', 'PCN Mode 1', 12);
+}
+
+function pcn1Run() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const source = pcn1Source_(ss);
+  const blocks = pcn1Headers_(source);
+  pcn1EnsureRegister_(ss, blocks);
+  pcn1EnsureClassification_(ss, pcn1ProductIds_(source));
+  const register = pcn1ReadRegister_(ss);
+  const classifications = pcn1ReadClassification_(ss);
+  const products = [];
+  const issues = [];
+  const seenProductIds = new Set();
+  const lastCol = source.getLastColumn();
+  const lastRow = source.getLastRow();
+
+  for (let r = PCN1.FIRST_PRODUCT_ROW; r <= lastRow; r += PCN1.READ_BATCH_ROWS) {
+    const count = Math.min(PCN1.READ_BATCH_ROWS, lastRow - r + 1);
+    const range = source.getRange(r, 1, count, lastCol);
+    const values = range.getValues();
+    const formats = range.getNumberFormats();
+    // Preserve leading zeros and any displayed product-code formatting.
+    const productNames = source.getRange(r, PCN1.PRODUCT_ID_COL, count, 1).getDisplayValues();
+
+    for (let i = 0; i < count; i++) {
+      const row = values[i], fmts = formats[i], sourceRow = r + i;
+      const suppliedId = String(productNames[i][0] || '').trim();
+      const nonempty = blocks.some(b =>
+        [b.actual, b.range, b.min, b.max].some(col => row[col] !== '' && row[col] !== null));
+      if (!suppliedId && !nonempty) continue;
+      const id = suppliedId || ('UNNAMED_ROW_' + sourceRow);
+      const ownIssues = [];
+      let numericalComplete = true;
+      const warn = (material, code, detail, severity) => {
+        const record = { id, row: sourceRow, material, code, severity: severity || 'BLOCKER', detail };
+        ownIssues.push(record);
+        issues.push(record);
+      };
+      if (!suppliedId) warn('', 'MISSING_PRODUCT_CODE', 'The product code in column A is missing.');
+      if (seenProductIds.has(id)) warn('', 'DUPLICATE_PRODUCT_CODE', 'Duplicate product code. Each source row must have a unique identity.');
+      seenProductIds.add(id);
+
+      const mixClp = classifications.get(id) || { health: '', physical: '' };
+      const health = pcn1ClassKey_(mixClp.health);
+      const physical = pcn1ClassKey_(mixClp.physical);
+      if (!health || !physical) warn('', 'FINAL_CLP_MISSING', 'Fill both health and physical final-mixture CLP classifications in PCN_Product_Classification; explicitly use NONE if unclassified.');
+
+      const comps = [];
+      let sum = 0;
+      for (const b of blocks) {
+        const act = pcn1ReadPercent_(row[b.actual], fmts[b.actual]);
+        const mini = pcn1ReadPercent_(row[b.min], fmts[b.min]);
+        const maxi = pcn1ReadPercent_(row[b.max], fmts[b.max]);
+        const width = pcn1ReadPercent_(row[b.range], fmts[b.range]);
+        const all = { ACT: act, MIN: mini, MAX: maxi, RANGE: width };
+        let unparseable = false;
+        for (const field of Object.keys(all)) {
+          if (all[field].error) {
+            warn(b.name, 'PERCENT_PARSE_ERROR', field + ': ' + all[field].error + '. Correct the source value; no guessing or automatic conversion is performed.');
+            numericalComplete = false;
+            unparseable = true;
+          }
+        }
+        if (unparseable) continue;
+        const a = act.value, low = mini.value, high = maxi.value, rangeWidth = width.value;
+        if (a === null && low === null && high === null && rangeWidth === null) continue;
+        if (a === null) {
+          warn(b.name, 'PRESENCE_UNCERTAIN', 'There are concentration details without an actual concentration.');
+          numericalComplete = false;
+          continue;
+        }
+        if (a < 0 || a > 100) {
+          warn(b.name, 'ACTUAL_OUT_OF_BOUNDS', 'Actual = ' + pcn1Fmt_(a) + '%. Must be within 0–100%. Check percentage formatting.');
+          numericalComplete = false;
+          continue;
+        }
+        if (a === 0) {
+          if ((low !== null && Math.abs(low) > PCN1.EPS) || (high !== null && Math.abs(high) > PCN1.EPS)) {
+            warn(b.name, 'ZERO_WITH_NONZERO_RANGE', 'The raw material is shown as absent but has a positive reporting range.');
+            numericalComplete = false;
+          }
+          continue; // A correctly absent raw material is NOT a component of this formulation.
+        }
+        sum += a;
+        const ref = register.get(pcn1Name_(b.name)) || {};
+        const type = pcn1ComponentType_(ref.type);
+        const referenceId = String(ref.id || '').trim(); // Information only. Not used for matching.
+        const major = pcn1Major_(ref.major);
+        if (!type) warn(b.name, 'COMPONENT_TYPE_UNVERIFIED', 'Mark this RAW MATERIAL CODE as Substance or MiM in PCN_Component_Register. A MiM is one component.');
+        if (major === null) warn(b.name, 'MAJOR_CONCERN_UNKNOWN', 'Set major-concern flag YES/NO for this raw material in the component register (Annex VIII Part B §3.4).');
+        const rawCodeKey = pcn1Name_(b.name); // SOLE component identity used in all grouping fingerprints.
+        // CAS, EC, referenceId, and component type never replace the raw material code.
+        if (low === null || high === null) {
+          warn(b.name, 'BOUNDS_MISSING', 'A positive actual concentration has missing MIN or MAX.');
+          numericalComplete = false;
+        } else if (low < -PCN1.EPS || high > 100 + PCN1.EPS || low > high + PCN1.EPS || a < low - PCN1.EPS || a > high + PCN1.EPS) {
+          warn(b.name, 'INVALID_REPORTING_RANGE', 'Expected 0 <= MIN <= ACT <= MAX <= 100; got ' +
+            [low, a, high].map(pcn1Fmt_).join(' / ') + '%.');
+          numericalComplete = false;
+        } else {
+          const submittedWidth = high - low;
+          if (major !== null && submittedWidth > pcn1MaxWidth_(low, major) + PCN1.EPS) {
+            warn(b.name, 'ANNEX_VIII_WIDTH_EXCEEDED', 'MIN–MAX span ' + pcn1Fmt_(submittedWidth) + ' percentage points; maximum is ' +
+              pcn1Fmt_(pcn1MaxWidth_(low, major)) + ' under Table ' + (major ? '1' : '2') + ', using the strictest band crossed.');
+          }
+          if (rangeWidth !== null && Math.abs(rangeWidth - submittedWidth) > 0.011) {
+            warn(b.name, 'RANGE_COLUMN_DIFFERS', 'RANGE column = ' + pcn1Fmt_(rangeWidth) + ' pp but MAX–MIN = ' + pcn1Fmt_(submittedWidth) +
+              ' pp. It may be a nominal permitted width; review calculation.', 'REVIEW');
+          }
+        }
+        comps.push({ sourceCode: b.name, componentId: rawCodeKey, type, referenceId, actual: a, min: low, max: high, major });
+      }
+
+      if (sum > 100 + PCN1.TOTAL_TOLERANCE) {
+        warn('', 'TOTAL_OVER_100', 'Sum of positive ingredient concentrations = ' + pcn1Fmt_(sum) + '%. Check percentage format, omitted duplication and formula.');
+      } else if (sum < 100 - PCN1.TOTAL_TOLERANCE) {
+        warn('', 'COMPOSITION_COMPLETENESS_REVIEW', 'Sum of listed positive ingredients = ' + pcn1Fmt_(sum) + '%. Check whether the dataset includes all relevant components.', 'REVIEW');
+      }
+      const ownBlockers = ownIssues.filter(x => x.severity === 'BLOCKER');
+      const classKey = health && physical ? JSON.stringify([health, physical]) : '';
+      const codeItems = comps.map(c => [pcn1Name_(c.sourceCode), pcn1Fmt_(c.min), pcn1Fmt_(c.max)].join('@')).sort();
+      // The candidate grouping fingerprint deliberately uses ONLY the row-2 raw material code
+      // plus identical PCN MIN/MAX intervals and matching final-mixture CLP classifications.
+      // No CAS/EC/reference ID is consulted here (important for MiMs).
+      const verifiedItems = comps.map(c => [pcn1Name_(c.sourceCode), pcn1Fmt_(c.min), pcn1Fmt_(c.max)].join('@')).sort();
+      const exactFingerprint = numericalComplete ? JSON.stringify([classKey || 'CLP_UNKNOWN', codeItems]) : '';
+      const verifiedFingerprint = ownBlockers.length === 0 && classKey ? JSON.stringify([classKey, verifiedItems]) : '';
+      const cohortFingerprint = JSON.stringify([classKey || 'CLP_UNKNOWN', comps.map(c => pcn1Name_(c.sourceCode)).sort()]);
+      products.push({ id, sourceRow, comps, ownIssues, health: mixClp.health, physical: mixClp.physical,
+        exactFingerprint, verifiedFingerprint, cohortFingerprint, numericalComplete });
+    }
+  }
+
+  // Fast O(products × components) indexing, not O(products²) all-to-all matching.
+  const verifiedMap = new Map(), tentativeMap = new Map(), componentCohorts = new Map(); // All keys use raw-material codes.
+  for (const p of products) {
+    if (p.verifiedFingerprint) pcn1PushMap_(verifiedMap, p.verifiedFingerprint, p);
+    if (p.exactFingerprint) pcn1PushMap_(tentativeMap, p.exactFingerprint, p);
+    componentCohorts.set(p.cohortFingerprint, (componentCohorts.get(p.cohortFingerprint) || 0) + 1);
+  }
+  const verifiedGroups = [...verifiedMap.values()].filter(a => a.length >= 2).sort(pcn1GroupOrder_);
+  const preliminaryGroups = [...tentativeMap.values()].filter(a => a.length >= 2).sort(pcn1GroupOrder_);
+  const byVerifiedId = new Map(), byPrelimId = new Map();
+  verifiedGroups.forEach((group, i) => group.forEach(p => byVerifiedId.set(p.sourceRow, PCN1.GROUP_PREFIX + String(i + 1).padStart(4, '0'))));
+  preliminaryGroups.forEach((group, i) => group.forEach(p => byPrelimId.set(p.sourceRow, PCN1.PROVISIONAL_PREFIX + String(i + 1).padStart(4, '0'))));
+
+  const summary = [['Group ID', 'Products', 'Status', 'Health CLP', 'Physical CLP', 'Product IDs', 'Warnings']];
+  const members = [['Product ID', 'Source row', 'PCN candidate group', 'Technical match', 'Assessment', 'Components', 'Identical raw-code set count', 'Issue codes']];
+  const ranges = [['PCN candidate group', 'Raw material code (MATCH KEY)', 'Component type', 'Reference ID (INFO ONLY)', 'MIN %', 'MAX %', 'Lowest actual %', 'Highest actual %', 'Annex VIII table', 'Max width (pp)']];
+  const exceptions = [['Product ID', 'Source row', 'Raw material', 'Severity', 'Reason code', 'Explanation']];
+  const prelim = [['Technical match ID', 'Products', 'Status', 'Product IDs', 'Explanation']];
+
+  for (const it of issues) exceptions.push([it.id, it.row, it.material, it.severity, it.code, it.detail]);
+  verifiedGroups.forEach((group, i) => {
+    const gid = PCN1.GROUP_PREFIX + String(i + 1).padStart(4, '0');
+    const warningCount = group.reduce((n, p) => n + p.ownIssues.filter(x => x.severity === 'REVIEW').length, 0);
+    summary.push([gid, group.length, warningCount ? 'CANDIDATE—REVIEW WARNINGS' : 'CANDIDATE—NOT APPROVED',
+      group[0].health, group[0].physical, group.map(p => p.id).join(', ').slice(0, 40000), warningCount]);
+    for (const c of [...group[0].comps].sort((a,b) => a.componentId.localeCompare(b.componentId))) {
+      const matches = group.flatMap(p => p.comps.filter(x => x.componentId === c.componentId));
+      const actuals = matches.map(x => x.actual);
+      ranges.push([gid, c.sourceCode, c.type, c.referenceId, c.min, c.max, Math.min(...actuals), Math.max(...actuals),
+        c.major ? 'Table 1' : 'Table 2', pcn1MaxWidth_(c.min, c.major)]);
+    }
+  });
+  preliminaryGroups.forEach((group, i) => {
+    const pid = PCN1.PROVISIONAL_PREFIX + String(i + 1).padStart(4, '0');
+    prelim.push([pid, group.length, 'PRELIMINARY ONLY—NOT GROUP ELIGIBILITY',
+      group.map(p => p.id).join(', ').slice(0, 40000),
+      'Same row-2 RAW MATERIAL CODES and reported MIN/MAX intervals; matching is independent of CAS/EC. Confirm code-to-substance/MiM mapping, CLP classifications and all applicable checks.']);
+  });
+  products.forEach(p => {
+    const gid = byVerifiedId.get(p.sourceRow) || '';
+    const tid = byPrelimId.get(p.sourceRow) || '';
+    const blockers = p.ownIssues.filter(x => x.severity === 'BLOCKER');
+    const status = gid ? 'REGULATORY CANDIDATE—REVIEW' :
+      blockers.length ? 'DATA/REGULATORY BLOCKER' :
+      tid ? 'TECHNICAL MATCH ONLY' : 'NO EXACT GROUP';
+    members.push([p.id, p.sourceRow, gid, tid, status, p.comps.length,
+      componentCohorts.get(p.cohortFingerprint) || 1, [...new Set(p.ownIssues.map(x => x.code))].join('; ')]);
+  });
+  pcn1Write_(ss, 'PCN_Mode1_Summary', summary);
+  pcn1Write_(ss, 'PCN_Mode1_Members', members);
+  pcn1Write_(ss, 'PCN_Mode1_Ranges', ranges);
+  pcn1Write_(ss, 'PCN_Mode1_Exceptions', exceptions);
+  pcn1Write_(ss, 'PCN_Mode1_Preliminary', prelim);
+  ss.toast('Processed ' + products.length + ' products; ' + verifiedGroups.length + ' raw-code-based candidate groups; ' +
+    preliminaryGroups.length + ' technical matches; ' + issues.length + ' findings.', 'PCN Mode 1', 15);
+}
+
+function pcn1Source_(ss) {
+  const sh = ss.getSheetByName(PCN1.SOURCE_SHEET);
+  if (!sh) throw new Error('Source tab ' + PCN1.SOURCE_SHEET + ' not found. Change PCN1.SOURCE_SHEET.');
+  if (sh.getLastRow() < PCN1.FIRST_PRODUCT_ROW) throw new Error('No products below header rows.');
+  return sh;
+}
+
+function pcn1Headers_(sh) {
+  const lastCol = sh.getLastColumn();
+  const headers = sh.getRange(1, 1, PCN1.SUBHEADER_ROW, lastCol).getDisplayValues();
+  const sub = headers[PCN1.SUBHEADER_ROW - 1];
+  const blocks = [], seen = new Set();
+  for (let c = PCN1.FIRST_MATERIAL_COL - 1; c < lastCol; c++) {
+    if (pcn1HeaderField_(sub[c]) !== 'actual') continue;
+    const positions = { actual: c, range: null, min: null, max: null };
+    for (let j = c + 1; j <= Math.min(c + 3, lastCol - 1); j++) {
+      const f = pcn1HeaderField_(sub[j]);
+      if (f && positions[f] === null) positions[f] = j;
+    }
+    if ([positions.range, positions.min, positions.max].some(x => x === null)) {
+      throw new Error('Incomplete ACT/RANGE/MIN/MAX block starting column ' + (c+1) + '.');
+    }
+    // Merged heading cells are filled only at the first column of each block.
+    // Row 2 raw material code is the sole grouping identity. CAS and EC below are only metadata.
+    const name = String(headers[PCN1.MATERIAL_ROW - 1][c] || '').trim();
+    if (!name) throw new Error('Missing raw-material code above ACT in column ' + (c+1) + '.');
+    const norm = pcn1Name_(name);
+    if (seen.has(norm)) throw new Error('Duplicate raw-material code: ' + name + '. Resolve before screening.');
+    seen.add(norm);
+    blocks.push({ name, ...positions,
+      cas: String(headers[PCN1.CAS_ROW - 1][c] || '').trim(),
+      ec: String(headers[PCN1.EC_ROW - 1][c] || '').trim(),
+      majorHint: String(headers[PCN1.MAJOR_CONCERN_ROW - 1][c] || '').trim() });
+    c = positions.max;
+  }
+  if (!blocks.length) throw new Error('No ACT / RANGE / MIN / MAX material blocks found in row 5.');
+  return blocks;
+}
+
+function pcn1HeaderField_(v) {
+  const s = String(v || '').trim().toUpperCase();
+  if (['ACT','ACTUAL','NOMINAL'].includes(s)) return 'actual';
+  if (['RANGE','WIDTH','RANGE WIDTH'].includes(s)) return 'range';
+  if (['MIN','MINIMUM'].includes(s)) return 'min';
+  if (['MAX','MAXIMUM'].includes(s)) return 'max';
+  return '';
+}
+
+function pcn1ReadPercent_(raw, numFmt) {
+  if (raw === '' || raw === null || raw === undefined || String(raw).trim() === '-') return { value: null, error: '' };
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw)) return { value: null, error: 'Non-finite numeric value' };
+    return { value: pcn1IsPercentFmt_(numFmt) ? raw * 100 : raw, error: '' };
+  }
+  // Accept strict decimal text with optional percent sign. Do not silently fix
+  // strings such as '79 71%', '82.23K' or '75.67ª'.
+  const s = String(raw).trim();
+  const match = s.match(/^([+-]?(?:\d+(?:[.,]\d+)?|[.,]\d+))\s*(%)?$/);
+  if (!match) return { value: null, error: 'Invalid percentage text "' + s + '"' };
+  const result = Number(match[1].replace(',', '.'));
+  return Number.isFinite(result) ? { value: result, error: '' } : { value: null, error: 'Invalid number' };
+}
+
+function pcn1IsPercentFmt_(fmt) {
+  // Excel/Sheets numeric percent format auto-multiplies displayed value by 100.
+  // Ignore literal text in quotes and escaped percent signs.
+  const f = String(fmt || '').split(';')[0].replace(/"[^"]*"/g, '').replace(/\\./g, '');
+  return f.indexOf('%') !== -1;
+}
+
+function pcn1MaxWidth_(low, major) {
+  // ECHA: Where a proposed range crosses bands, use the stricter width.
+  // At a boundary the band beginning at that boundary applies.
+  if (major) return low < 0.1 ? 0.1 : low < 1 ? 0.3 : low < 10 ? 1 : low < 25 ? 3 : 5;
+  return low < 1 ? 1 : low < 10 ? 3 : low < 25 ? 10 : 20;
+}
+
+function pcn1EnsureRegister_(ss, blocks) {
+  const hdr = ['Raw material code (GROUP KEY)', 'Source CAS', 'Source EC', 'Reference ID (optional; NOT a grouping key)', 'Component type (Substance/MiM)',
+    'Major concern (YES/NO)', 'Major concern from row 1', 'Notes'];
+  // Safe migration: preserve all existing reference values and change ONLY the affected header labels.
+  const old = ss.getSheetByName('PCN_Component_Register');
+  if (old) {
+    const first = String(old.getRange(1, 1).getValue() || '');
+    const fourth = String(old.getRange(1, 4).getValue() || '');
+    if (first === 'Raw material code') old.getRange(1, 1).setValue(hdr[0]);
+    if (fourth === 'Confirmed component ID') old.getRange(1, 4).setValue(hdr[3]);
+  }
+  const sh = pcn1EnsureSheet_(ss, 'PCN_Component_Register', hdr);
+  const existing = sh.getLastRow() > 1 ? sh.getRange(2,1,sh.getLastRow()-1,1).getValues() : [];
+  const seen = new Set(existing.map(x => pcn1Name_(x[0])));
+  const add = blocks.filter(b => !seen.has(pcn1Name_(b.name))).map(b => [b.name, b.cas, b.ec, '', '',
+    pcn1Major_(b.majorHint) === null ? '' : (pcn1Major_(b.majorHint) ? 'YES':'NO'), b.majorHint, '']);
+  pcn1Append_(sh, add, hdr.length);
+}
+
+function pcn1EnsureClassification_(ss, ids) {
+  const hdr = ['Product ID', 'Health CLP classification (or NONE)', 'Physical CLP classification (or NONE)'];
+  const sh = pcn1EnsureSheet_(ss, 'PCN_Product_Classification', hdr);
+  const existing = sh.getLastRow()>1 ? sh.getRange(2,1,sh.getLastRow()-1,1).getDisplayValues() : [];
+  const seen = new Set(existing.map(x => String(x[0]).trim()));
+  pcn1Append_(sh, ids.filter(x => !seen.has(x)).map(x => [x,'','']), hdr.length);
+}
+
+function pcn1ProductIds_(sh) {
+  const rows = sh.getRange(PCN1.FIRST_PRODUCT_ROW,PCN1.PRODUCT_ID_COL,sh.getLastRow()-PCN1.FIRST_PRODUCT_ROW+1,1).getDisplayValues();
+  return [...new Set(rows.map(x => String(x[0] || '').trim()).filter(Boolean))];
+}
+
+function pcn1EnsureSheet_(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+    pcn1StyleHeader_(sh, headers.length);
+  } else {
+    const h = sh.getRange(1,1,1,headers.length).getValues()[0];
+    if (headers.some((x,i) => x !== h[i])) throw new Error('Unexpected header in ' + name + '. Restore the original reference-sheet header.');
+  }
+  return sh;
+}
+
+function pcn1Append_(sheet, rows, countCols) {
+  for (let i=0; i<rows.length; i+=PCN1.WRITE_BATCH_ROWS) {
+    const part = rows.slice(i,i+PCN1.WRITE_BATCH_ROWS);
+    sheet.getRange(sheet.getLastRow()+1,1,part.length,countCols).setValues(part);
+  }
+}
+
+function pcn1ReadRegister_(ss) {
+  const sh=ss.getSheetByName('PCN_Component_Register'), out=new Map();
+  if (sh.getLastRow()<2) return out;
+  const rows=sh.getRange(2,1,sh.getLastRow()-1,8).getValues();
+  rows.forEach(row=>{
+    const key=pcn1Name_(row[0]);
+    if (key) {
+      if (out.has(key)) throw new Error('Duplicate raw material code in PCN_Component_Register: ' + row[0]);
+      out.set(key,{id: row[3],type:row[4],major:row[5]});
+    }
+  });
+  return out;
+}
+
+function pcn1ReadClassification_(ss) {
+  const sh=ss.getSheetByName('PCN_Product_Classification'), out=new Map();
+  if (sh.getLastRow()<2) return out;
+  sh.getRange(2,1,sh.getLastRow()-1,3).getValues().forEach(row=>{
+    const id=String(row[0] || '').trim();
+    if (id) out.set(id,{health:String(row[1] || '').trim(),physical:String(row[2] || '').trim()});
+  });
+  return out;
+}
+
+function pcn1Major_(v) {
+  const s=String(v===null || v===undefined ? '':v).trim().toUpperCase();
+  if (['YES','Y','TRUE','1'].includes(s)) return true;
+  if (['NO','N','FALSE','0'].includes(s)) return false;
+  return null;
+}
+
+function pcn1ComponentType_(v) {
+  const s=String(v||'').trim().toUpperCase().replace(/[-_]/g,' ');
+  if (s==='SUBSTANCE') return 'SUBSTANCE';
+  if (['MIM','MIXTURE IN MIXTURE','MIXTURE'].includes(s)) return 'MIM';
+  return '';
+}
+
+function pcn1ClassKey_(v) {
+  const s=String(v || '').trim().replace(/\s+/g,' ').toUpperCase();
+  if (!s) return '';
+  if (['NONE','NOT CLASSIFIED','NO CLASSIFICATION'].includes(s)) return 'NONE';
+  return s.split(';').map(x=>x.trim()).filter(Boolean).sort().join(';');
+}
+
+function pcn1GroupOrder_(a,b) { return b.length-a.length || a[0].id.localeCompare(b[0].id); }
+function pcn1PushMap_(map,k,v) { if (!map.has(k)) map.set(k,[]); map.get(k).push(v); }
+function pcn1Name_(v) { return String(v===null || v===undefined ? '':v).trim().replace(/\s+/g,' ').toUpperCase(); }
+function pcn1Fmt_(n) { return n===null || n===undefined || !Number.isFinite(n) ? 'MISSING' : Number(n.toFixed(8)).toString(); }
+
+function pcn1Write_(ss, name, matrix) {
+  let sh=ss.getSheetByName(name);
+  if (!sh) sh=ss.insertSheet(name);
+  sh.clearContents();
+  const count=matrix[0].length;
+  for (let i=0; i<matrix.length; i+=PCN1.WRITE_BATCH_ROWS) {
+    const part=matrix.slice(i,i+PCN1.WRITE_BATCH_ROWS).map(row=>row.map(v=>
+      typeof v==='string' && /^[=+@]/.test(v) ? "'"+v : v));
+    sh.getRange(i+1,1,part.length,count).setValues(part);
+  }
+  pcn1StyleHeader_(sh,count);
+}
+
+function pcn1StyleHeader_(sh, count) {
+  sh.getRange(1,1,1,count).setBackground('#153047').setFontColor('white').setFontWeight('bold');
+  sh.setFrozenRows(1);
+}
