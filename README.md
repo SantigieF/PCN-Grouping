@@ -1,13 +1,15 @@
 /**
- * EU Poison Centre Notification (PCN) — Mode 1 / Conservative grouping screen (v1.2 diagnostics).
+ * EU Poison Centre Notification (PCN) — Mode 1 / Conservative grouping screen (v1.3 source-layout detection).
  *
  * This is a preliminary regulatory screening aid, NOT an Annex VIII validation,
  * IUCLID submission, PCN authorisation, or UFI allocation tool.
  *
- * Expected source structure:
- *   row 1: raw-material headings (one per four-column block; may be merged)
- *   row 2: Actual concentration | Concentration range | Min | Max
- *   column A: product identifier; each subsequent row is one product
+ * Source structure: ONE ROW PER PRODUCT and raw-material COLUMN BLOCKS,
+ * with Actual concentration, Concentration range, Minimum and Maximum subcolumns.
+ * The script finds the source tab and header rows, regardless of tab name,
+ * header row positions, subcolumn ordering or product-ID column position.
+ * The range text subcolumn is ignored for grouping: numeric Min/Max are used.
+ * Use "0. Inspect original sheet layout" to confirm correct detection first.
  *
  * The script does NOT modify the source. Every raw-material heading is treated
  * as a component key regardless of whether the raw material is a substance
@@ -19,16 +21,11 @@
  * All group-submission decisions remain preliminary pending PCN review.
  */
 const PCN_MODE1 = {
-  SOURCE_SHEET: 'Formulations',       // CHANGE to your source tab name
-  MATERIAL_HEADER_ROW: 1,           // row with raw material names
-  SUBHEADER_ROW: 2,                 // row with Actual / Range / Min / Max
-  FIRST_DATA_ROW: 3,
-  PRODUCT_ID_COLUMN: 1,             // 1 = column A
-  FIRST_MATERIAL_COLUMN: 2,         // 2 = column B; unique stable raw-material headings
-  INPUT_PERCENT_MODE: 'AUTO',        // AUTO: detect Google Sheets percentage formatting;
-                                     // NUMBER: 12 means 12%; FRACTION: 0.12 means 12%.
-  VALUES_ARE_FRACTIONS: false,      // Legacy setting; ignored unless INPUT_PERCENT_MODE is removed.
-  ACTUAL_TOTAL_TOLERANCE: 1,        // diagnostic tolerance in percentage points, NOT a legal PCN threshold
+  SOURCE_SHEET: '',                 // BLANK = detect the original source tab; no renaming needed.
+  HEADER_SCAN_ROWS: 12,             // Look for material/subheader pairs in the first 12 rows.
+  MAX_HEADER_GAP: 2,                // Subheader may be 1–2 rows below material headings.
+  INPUT_PERCENT_MODE: 'AUTO',       // AUTO handles percent-formatted Sheets cells.
+  ACTUAL_TOTAL_TOLERANCE: 1,        // Diagnostic only; not a legal PCN threshold (percentage points).
   READ_BATCH_ROWS: 150,
   WRITE_BATCH_ROWS: 2000,
   EPSILON: 1e-7
@@ -37,6 +34,7 @@ const PCN_MODE1 = {
 function onOpen() {
   SpreadsheetApp.getUi()
     .createMenu('PCN Mode 1')
+    .addItem('0. Inspect original sheet layout', 'pcnMode1Inspect')
     .addItem('1. Set up / update lookup sheets', 'pcnMode1Setup')
     .addItem('2. Run conservative grouping', 'pcnMode1Run')
     .addToUi();
@@ -46,8 +44,9 @@ function onOpen() {
 function pcnMode1Setup() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const source = pcnMode1Source_(ss);
-  const materials = pcnMode1Materials_(source);
-  const ids = pcnMode1ProductIds_(source);
+  const layout = pcnMode1DetectLayout_(source);
+  const materials = layout.materials;
+  const ids = pcnMode1ProductIds_(source, layout);
   pcnMode1EnsureRegister_(ss, materials.map(x => x.name));
   pcnMode1EnsureClassifications_(ss, ids);
   ss.toast('Lookup sheets ready. Substance/MiM type is NOT required. Fill major-concern YES/NO and final-mixture CLP classifications.', 'PCN Mode 1', 10);
@@ -57,9 +56,14 @@ function pcnMode1Setup() {
 function pcnMode1Run() {
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   const source = pcnMode1Source_(ss);
-  const materials = pcnMode1Materials_(source);
+  const layout = pcnMode1DetectLayout_(source);
+  const materials = layout.materials;
+  if (layout.incomplete.length) {
+    pcnMode1Write_(ss, 'PCN_Mode1_Layout_Check', pcnMode1LayoutRows_(source, layout));
+    throw new Error('Source header mapping has ' + layout.incomplete.length + ' incomplete/ambiguous raw-material block(s). Review PCN_Mode1_Layout_Check before running. No grouping results were generated.');
+  }
   pcnMode1EnsureRegister_(ss, materials.map(x => x.name));
-  pcnMode1EnsureClassifications_(ss, pcnMode1ProductIds_(source));
+  pcnMode1EnsureClassifications_(ss, pcnMode1ProductIds_(source, layout));
   const register = pcnMode1ReadRegister_(ss);
   const classes = pcnMode1ReadClasses_(ss);
   const issues = [];
@@ -70,19 +74,19 @@ function pcnMode1Run() {
   // Read source formatting ONCE. For percentage-formatted numeric cells, Sheets
   // getValues() returns fractions (e.g. displayed 12% is numeric 0.12).
   // All rows of a material column should use the same number format.
-  const percentFormats = source.getRange(PCN_MODE1.FIRST_DATA_ROW, 1, 1, lastColumn).getNumberFormats()[0];
+  const percentFormats = source.getRange(layout.firstDataRow, 1, 1, lastColumn).getNumberFormats()[0];
   const diagnosticRows = [['Product ID', 'Sheet row', 'Raw material', 'Actual cell', 'Raw actual', 'Actual % interpreted', 'Min cell', 'Reported min %', 'Max cell', 'Reported max %', 'Width pp', 'Permitted width pp', 'Applicable table', 'Status', 'Explanation', 'Source number format']];
   const totalRows = [['Product ID', 'Source row', 'Sum actual %', 'Sum lower bounds %', 'Sum upper bounds %', 'Difference from 100 pp', 'Raw-material count', 'Largest component contributions', 'Interpretation']];
   let widthFlagCount = 0;
   let totalFlagCount = 0;
 
-  for (let rowStart = PCN_MODE1.FIRST_DATA_ROW; rowStart <= lastRow; rowStart += PCN_MODE1.READ_BATCH_ROWS) {
+  for (let rowStart = layout.firstDataRow; rowStart <= lastRow; rowStart += PCN_MODE1.READ_BATCH_ROWS) {
     const count = Math.min(PCN_MODE1.READ_BATCH_ROWS, lastRow - rowStart + 1);
     const raw = source.getRange(rowStart, 1, count, lastColumn).getValues();
     for (let j = 0; j < raw.length; j++) {
       const values = raw[j];
       const sheetRow = rowStart + j;
-      const suppliedId = String(values[PCN_MODE1.PRODUCT_ID_COLUMN - 1] == null ? '' : values[PCN_MODE1.PRODUCT_ID_COLUMN - 1]).trim();
+      const suppliedId = String(values[layout.productIdColumn] == null ? '' : values[layout.productIdColumn]).trim();
       const nonblank = materials.some(m => ['actual', 'min', 'max'].some(f => m[f] != null && values[m[f]] !== '' && values[m[f]] != null));
       if (!suppliedId && !nonblank) continue;
       const productId = suppliedId || 'MISSING_ID_ROW_' + sheetRow;
@@ -244,6 +248,7 @@ function pcnMode1Run() {
     }
   }
 
+  pcnMode1Write_(ss, 'PCN_Mode1_Layout_Check', pcnMode1LayoutRows_(source, layout));
   pcnMode1Write_(ss, 'PCN_Mode1_Summary', summary);
   pcnMode1Write_(ss, 'PCN_Mode1_Members', members);
   pcnMode1Write_(ss, 'PCN_Mode1_Ranges', ranges);
@@ -253,49 +258,142 @@ function pcnMode1Run() {
   ss.toast('Screened ' + products.length + ' products; ' + widthFlagCount + ' width warnings and ' + totalFlagCount + ' actual-total warnings. See PCN_Mode1_*_Diagnostics.', 'PCN Mode 1', 15);
 }
 
+/** Auto-find the user's original wide-format sheet. Never require renaming a tab. */
 function pcnMode1Source_(ss) {
-  const sh = ss.getSheetByName(PCN_MODE1.SOURCE_SHEET);
-  if (!sh) throw new Error('Source tab "' + PCN_MODE1.SOURCE_SHEET + '" not found. Update SOURCE_SHEET in PCN_MODE1 config.');
-  if (sh.getLastRow() < PCN_MODE1.FIRST_DATA_ROW) throw new Error('Source sheet has no data rows.');
-  return sh;
-}
-
-function pcnMode1Materials_(sh) {
-  const lastCol = sh.getLastColumn();
-  const top = sh.getRange(PCN_MODE1.MATERIAL_HEADER_ROW, 1, 1, lastCol).getDisplayValues()[0];
-  const sub = sh.getRange(PCN_MODE1.SUBHEADER_ROW, 1, 1, lastCol).getDisplayValues()[0];
-  let currentName = '';
-  const blocks = new Map();
-  for (let col = PCN_MODE1.FIRST_MATERIAL_COLUMN - 1; col < lastCol; col++) {
-    // Merged material headings are nonblank only in the left-most cell.
-    const label = String(top[col] || '').trim();
-    if (label) currentName = label;
-    if (!currentName) continue;
-    const field = pcnMode1SubField_(sub[col]);
-    if (!field) continue;
-    if (!blocks.has(currentName)) blocks.set(currentName, { name: currentName, actual: null, min: null, max: null });
-    const obj = blocks.get(currentName);
-    if (obj[field] != null) throw new Error('Duplicate "' + field + '" subcolumn under material "' + currentName + '". Ensure material headings are unique.');
-    obj[field] = col; // zero-based index for getValues arrays
+  if (PCN_MODE1.SOURCE_SHEET) {
+    const named = ss.getSheetByName(PCN_MODE1.SOURCE_SHEET);
+    if (!named) throw new Error('Source tab "' + PCN_MODE1.SOURCE_SHEET + '" not found. Clear SOURCE_SHEET to auto-detect.');
+    return named;
   }
-  const out = [...blocks.values()];
-  const invalid = out.filter(b => b.actual == null || b.min == null || b.max == null);
-  if (!out.length || invalid.length) throw new Error('Cannot recognise Actual/Min/Max subcolumns. Check header row config and names. Incomplete blocks: ' + invalid.slice(0, 8).map(x => x.name).join(', '));
-  return out;
+  const sourceTabs = ss.getSheets().filter(sh => !pcnMode1GeneratedTab_(sh.getName()));
+  const candidates = [];
+  for (const sh of sourceTabs) {
+    try {
+      const layout = pcnMode1DetectLayout_(sh);
+      candidates.push({ sheet: sh, layout: layout });
+    } catch (e) { /* not a source-like sheet */ }
+  }
+  if (!candidates.length) throw new Error('No source sheet with recognizable raw-material blocks was found. Run the layout check after confirming your source has material headings and Actual, Min and Max subheadings.');
+  const active = ss.getActiveSheet();
+  const selected = candidates.find(c => c.sheet.getSheetId() === active.getSheetId());
+  if (selected) return selected.sheet;
+  candidates.sort((a,b) => b.layout.score-a.layout.score);
+  if (candidates.length > 1 && candidates[0].layout.score === candidates[1].layout.score) {
+    throw new Error('More than one original-style sheet found. Select your formulation sheet and rerun, or set SOURCE_SHEET to its existing name. Candidates: ' + candidates.map(c=>c.sheet.getName()).join(', '));
+  }
+  return candidates[0].sheet;
 }
 
-function pcnMode1SubField_(name) {
-  const s = String(name || '').trim().toLowerCase().replace(/[_\-]+/g, ' ');
-  if (/\b(min|minimum|lower)\b/.test(s)) return 'min';
-  if (/\b(max|maximum|upper)\b/.test(s)) return 'max';
-  if (/\b(actual|act|nominal)\b/.test(s) || (/\bconc(?:entration)?\b/.test(s) && !/\brange\b/.test(s))) return 'actual';
-  return null; // concentration-range descriptive/text subcolumn is not needed for Mode 1
+function pcnMode1GeneratedTab_(name) {
+  return /^PCN_Mode1_/i.test(name) || ['PCN_Component_Register','PCN_Product_Classification'].includes(name);
 }
 
-function pcnMode1ProductIds_(sh) {
-  const last = sh.getLastRow();
-  const data = sh.getRange(PCN_MODE1.FIRST_DATA_ROW, PCN_MODE1.PRODUCT_ID_COLUMN, last - PCN_MODE1.FIRST_DATA_ROW + 1, 1).getValues();
-  return [...new Set(data.map(r => String(r[0] == null ? '' : r[0]).trim()).filter(Boolean))];
+/**
+ * Detect two-level headers in the ORIGINAL spreadsheet. Raw materials can have
+ * merged first-level headings, and subcolumns can be in any order.
+ */
+function pcnMode1DetectLayout_(sh) {
+  const lastCol = sh.getLastColumn();
+  const scanRows = Math.min(sh.getLastRow(), PCN_MODE1.HEADER_SCAN_ROWS);
+  if (lastCol < 4 || scanRows < 3) throw new Error('Not enough rows/columns to parse.');
+  const header = sh.getRange(1, 1, scanRows, lastCol).getDisplayValues();
+  let best = null;
+  for (let h = 0; h < scanRows-1; h++) {
+    for (let r = h+1; r <= Math.min(scanRows-1,h+PCN_MODE1.MAX_HEADER_GAP); r++) {
+      const blocks = pcnMode1ParseMaterialBlocks_(header[h],header[r]);
+      const valid = blocks.filter(b=>!b.duplicate && b.actual !== null && b.min !== null && b.max !== null);
+      if (!valid.length) continue;
+      const incomplete = blocks.filter(b=>b.duplicate || b.actual === null || b.min === null || b.max === null);
+      const firstMaterial = Math.min(...valid.map(b=>Math.min(b.actual,b.min,b.max)));
+      let productIdColumn = null;
+      let productIdReason = '';
+      for (let c=0;c<firstMaterial;c++) {
+        const heading = (String(header[h][c]||'')+' '+String(header[r][c]||'')).trim();
+        if (/\b(product|formula(?:tion)?|recipe|sku|item|finished.?good|code|reference|ref|stock.?code)\b/i.test(heading) &&
+            !/\b(raw material|ingredient|component)\b/i.test(heading)) {
+          productIdColumn=c;
+          productIdReason='Detected from heading: '+heading;
+          break;
+        }
+      }
+      if (productIdColumn===null) {
+        productIdColumn = 0;
+        productIdReason = 'Assumed first column (not identified by header): verify this in Layout Check';
+      }
+      const score=valid.length*100 - incomplete.length*20 + (productIdReason.startsWith('Detected')?10:0);
+      if (!best || score>best.score) best={
+        materialHeaderRow:h+1, subheaderRow:r+1, firstDataRow:r+2,
+        productIdColumn, productIdReason, materials:valid, incomplete,
+        score
+      };
+    }
+  }
+  if (!best) throw new Error('Could not identify material blocks in '+sh.getName()+'. Need material headings plus Actual, Min and Max subheadings.');
+  if (best.firstDataRow>sh.getLastRow()) throw new Error('Sheet has headers but no product rows.');
+  return best;
+}
+
+/** The top row may contain merged material headings, present only in the first cell. */
+function pcnMode1ParseMaterialBlocks_(headings, subheadings) {
+  const blocks = new Map();
+  let current = '';
+  for(let col=0;col<headings.length;col++){
+    const label=String(headings[col]||'').trim();
+    if(label) current=label;
+    const field=pcnMode1SubField_(subheadings[col]);
+    if(!current || !field) continue;
+    if (!blocks.has(current)) blocks.set(current,{name:current, actual:null,min:null,max:null,range:null});
+    const block=blocks.get(current);
+    // Repeated subfields under one heading are a layout ambiguity;
+    // mark it invalid rather than guessing and comparing wrong columns.
+    if(block[field] !== null) block.duplicate=true;
+    else block[field]=col;
+  }
+  return [...blocks.values()];
+}
+
+function pcnMode1SubField_(label) {
+  const s=String(label||'').trim().toLowerCase().replace(/[_\-]+/g,' ').replace(/\s+/g,' ');
+  if(!s) return null;
+  if(/\b(min|minimum|lower|low)\b/.test(s)) return 'min';
+  if(/\b(max|maximum|upper|high)\b/.test(s)) return 'max';
+  if(/\b(range|band|interval)\b/.test(s)) return 'range';
+  if(/\b(actual|act|nominal|dosage|dose|used|quantity)\b/.test(s) ||
+     /^%$/.test(s) || /^concentration(?:\s*\(?%\)?)?$/.test(s) ||
+     /^conc(?:\.|\s*%)?$/.test(s)) return 'actual';
+  return null;
+}
+
+function pcnMode1ProductIds_(sh, layout) {
+  const last=sh.getLastRow();
+  const data=sh.getRange(layout.firstDataRow,layout.productIdColumn+1,last-layout.firstDataRow+1,1).getValues();
+  return [...new Set(data.map(r=>String(r[0]==null?'':r[0]).trim()).filter(Boolean))];
+}
+
+/** Shows the exact cells the script is about to interpret—no modifications to source. */
+function pcnMode1Inspect() {
+  const ss=SpreadsheetApp.getActiveSpreadsheet();
+  const source=pcnMode1Source_(ss);
+  const layout=pcnMode1DetectLayout_(source);
+  pcnMode1Write_(ss,'PCN_Mode1_Layout_Check',pcnMode1LayoutRows_(source,layout));
+  ss.toast('Original tab: '+source.getName()+'; '+layout.materials.length+' raw-material blocks mapped. See PCN_Mode1_Layout_Check.','PCN Mode 1',10);
+}
+function pcnMode1LayoutRows_(source,layout) {
+  const rows=[['Source tab','Raw material heading','Actual column','Range column (ignored)','Minimum column','Maximum column','Sample actual','Sample min','Sample max','Header rows','Product ID column / detection']];
+  const sample=source.getRange(layout.firstDataRow,1,1,source.getLastColumn()).getDisplayValues()[0];
+  for(const m of layout.materials){
+    const col=i=>i==null?'':pcnMode1ColumnLabel_(i+1);
+    rows.push([source.getName(),m.name,col(m.actual),col(m.range),col(m.min),col(m.max),
+      sample[m.actual],sample[m.min],sample[m.max],
+      layout.materialHeaderRow+' / '+layout.subheaderRow,
+      col(layout.productIdColumn)+' — '+layout.productIdReason]);
+  }
+  for(const m of layout.incomplete){
+    rows.push([source.getName(),'REVIEW INCOMPLETE / DUPLICATE HEADER: '+m.name,'','','','','','','',
+      layout.materialHeaderRow+' / '+layout.subheaderRow,
+      'Check missing Actual/Min/Max headings for this raw material']);
+  }
+  return rows;
 }
 
 function pcnMode1EnsureRegister_(ss, names) {
