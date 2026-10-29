@@ -1,0 +1,32 @@
+I want to begin grouping my formulations for EU Poison Centre Notification using Mode 1 — Conservative Grouping.
+
+Use my existing formulation spreadsheet without changing its structure.
+
+First, examine the spreadsheet and identify:
+
+1. The product identification column.
+2. The raw material column groups.
+3. The actual concentration, concentration range, minimum and maximum columns.
+4. The finished-mixture hazard classifications.
+5. The raw material hazard classifications.
+6. The product-use information.
+
+Show me how you have interpreted the spreadsheet before performing the grouping analysis.
+
+Next, determine whether the existing data is sufficient to perform Mode 1 grouping under CLP Annex VIII.
+
+Use the raw material classifications to determine the applicable concentration-reporting tables. Validate the existing concentration ranges and identify any data-quality problems.
+
+Do not automatically reject formulations because their PCN upper concentration limits total more than 100%.
+
+Do not assume that a missing value means zero or that two raw materials with similar names are identical.
+
+Only group formulations where all the applicable Mode 1 criteria are satisfied.
+
+Identify formulations that could potentially be grouped if their concentration ranges were optimised, but keep these separate from confirmed Mode 1 candidates.
+
+For every proposed group, explain why the formulations have been grouped and provide an auditable record of the components and concentration ranges used.
+
+If the dataset is too large for reliable direct analysis, recommend and generate a Google Apps Script implementation that follows the attached regulatory instructions.
+
+Do not modify the original spreadsheet.
